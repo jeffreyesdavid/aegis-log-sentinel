@@ -28,10 +28,31 @@ Requires Python 3.10+ (uses only the Python standard library: `sqlite3`, `hashli
 ```bash
 export AEGIS_HMAC_KEY="your-own-secret"   # optional for the demo; required for real telemetry
 python3 sentinel.py
-python3 -m unittest -v                    # 18 tests
+python3 -m unittest -v                    # 27 tests
 ```
 
 The pseudonymization key is read from `AEGIS_HMAC_KEY` and never stored in source. Without it, the demo runs on a clearly labeled demo key and prints a warning.
+
+---
+
+## AI Bot Detection Layer (v1.2)
+
+**The problem:** a smarter bot adds random jitter to every delay (for example 0.75–1.25 s). Its timing spread now looks human, so the v1.1 cadence rule misses it. In the benchmark, v1.1 rules alone caught **0 of 4** of these "smart bots."
+
+**The fix:** an unsupervised second opinion that learns what normal looks like from the player population itself, with no labeled cheat data required.
+
+| Step | What it does |
+|---|---|
+| Behavioral features | Per player: timing spread (CV), slow-vs-fast gap ratio (log p90/p10), action-loop repetition, next-action predictability |
+| Isolation Forest | Standard-library implementation of Liu, Ting & Zhou (2008). Random cuts isolate unusual players in fewer steps; small subsamples (8 per tree) prevent a group of similar bots from hiding together ("masking") |
+| Explanation | Each flag names the features furthest from the crowd, e.g. `action loop repetition 1.00 vs crowd 0.36` |
+| Human in the loop | AI flags go to a `REVIEW` queue for session-replay checks. The AI never bans and never lowers a rule-based severity |
+
+**Why these features:** humans mix quick clicks with real pauses, so their slow-vs-fast gap ratio is wide; a bot drawing "random" delays from a fixed window cannot pause. Humans who grind the same node still do it in a messy order; a script repeats an exact loop.
+
+**Results (synthetic data):** tuned on 8 random worlds, then tested on 10 worlds never seen during tuning: **110 of 110 cheaters flagged, 0 of 470 legitimate players flagged**, including 100 "grinders" who farm repetitively on purpose.
+
+**Limits, stated plainly:** all data is synthetic, and the human/bot score margin is narrow (about 0.58 vs 0.60), so thresholds would need recalibration on real telemetry. Real deployments group players by play style before modeling, as in Chung et al. (2015), and add signals this demo lacks: movement paths, social and trade graphs, and network patterns.
 
 ---
 

@@ -102,7 +102,7 @@ class TestBaseline(unittest.TestCase):
     def test_synthetic_baseline_perfect(self):
         conn = sentinel.init_db(sentinel.build_synthetic_dataset())
         findings = sentinel.analyze_players(conn)
-        bad = {"bot_farm", "speed_hacker", "item_duper"}
+        bad = {"bot_farm", "speed_hacker", "item_duper", "smart_bot"}
         for f in findings:
             self.assertEqual(f["flagged"], f["archetype"] in bad, f["raw_player_id"])
 
@@ -111,6 +111,68 @@ class TestBaseline(unittest.TestCase):
         for f in sentinel.analyze_players(conn):
             if f["archetype"] == "high_skill":
                 self.assertEqual(f["severity"], "CLEAN")
+
+
+BAD = {"bot_farm", "speed_hacker", "item_duper", "smart_bot"}
+
+
+def run(seed):
+    return sentinel.analyze_players(sentinel.init_db(sentinel.build_synthetic_dataset(seed)))
+
+
+class TestAILayer(unittest.TestCase):
+    def test_smart_bots_evade_v11_rules(self):
+        # Proves the gap: rules alone (no AI layer) miss every smart bot.
+        evs = [e for e in sentinel.build_synthetic_dataset(7) if e.archetype == "smart_bot"]
+        by = {}
+        for e in evs:
+            by.setdefault(e.player_id, []).append(e)
+        for pid, es in by.items():
+            self.assertFalse(analyze_player(pid, sorted(es, key=lambda e: e.timestamp))["flagged"], pid)
+
+    def test_ai_catches_smart_bots(self):
+        for f in run(7):
+            if f["archetype"] == "smart_bot":
+                self.assertEqual(f["severity"], "REVIEW")
+                self.assertTrue(any(r.startswith("ai_anomaly") for r in f["reasons"]))
+
+    def test_grinders_and_casuals_stay_clean(self):
+        for f in run(7):
+            if f["archetype"] in ("grinder", "normal", "high_skill"):
+                self.assertFalse(f["flagged"], f["raw_player_id"])
+
+    def test_holdout_worlds_no_false_positives(self):
+        # Seeds never used while tuning: every cheater caught, no human flagged.
+        for seed in (31, 404, 31337):
+            for f in run(seed):
+                self.assertEqual(f["flagged"], f["archetype"] in BAD, (seed, f["raw_player_id"]))
+
+    def test_ai_never_downgrades_rules(self):
+        for f in run(7):
+            if f["archetype"] in ("speed_hacker", "item_duper"):
+                self.assertEqual(f["severity"], "CRITICAL")
+            if f["archetype"] == "bot_farm":
+                self.assertEqual(f["severity"], "HIGH")
+
+    def test_isolation_forest_scores_outlier_higher(self):
+        import random
+        rng = random.Random(1)
+        crowd = [[rng.gauss(0, 1), rng.gauss(0, 1)] for _ in range(60)]
+        forest = sentinel.IsolationForest(seed=3).fit(crowd)
+        self.assertGreater(forest.score([8.0, 8.0]), forest.score([0.0, 0.0]))
+
+    def test_loop_score(self):
+        self.assertEqual(sentinel.loop_score(["a", "b", "c"] * 5), 1.0)
+        self.assertLess(sentinel.loop_score(list("abacbcaabcbacbab")), 0.8)
+
+    def test_timing_range_narrow_for_fixed_window(self):
+        self.assertLess(sentinel.timing_range([0.8, 1.2, 1.0, 0.9, 1.1, 1.0, 0.85, 1.15]), 0.6)
+        self.assertGreater(sentinel.timing_range([0.4, 0.6, 2.5, 0.5, 4.0, 0.7, 1.9, 0.45]), 1.2)
+
+    def test_ai_explanations_are_plain_english(self):
+        f = next(x for x in run(7) if x["archetype"] == "smart_bot")
+        text = " ".join(f["reasons"])
+        self.assertIn("vs crowd", text)
 
 
 if __name__ == "__main__":
