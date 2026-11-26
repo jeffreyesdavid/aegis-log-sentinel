@@ -26,5 +26,26 @@ Aegis Log Sentinel is a lightweight game security investigation and triage pipel
 Requires Python 3.10+ (uses only the Python standard library: `sqlite3`, `hashlib`, `hmac`, `statistics`, `math`).
 
 ```bash
+export AEGIS_HMAC_KEY="your-own-secret"   # optional for the demo; required for real telemetry
 python3 sentinel.py
+python3 -m unittest -v                    # 18 tests
+```
+
+The pseudonymization key is read from `AEGIS_HMAC_KEY` and never stored in source. Without it, the demo runs on a clearly labeled demo key and prints a warning.
+
+---
+
+## Hardening (v1.1)
+
+Fixes from a self-audit of v1:
+
+| Issue | Fix |
+|---|---|
+| Severity was set by plain assignment, so a future check could downgrade a `CRITICAL` | `escalate()` with a severity rank: findings can only go up, never down |
+| HMAC key hardcoded in source | Key loaded from the `AEGIS_HMAC_KEY` environment variable |
+| Reported IP was the player's first event, not the event that triggered the alert | Each finding records the evidence event and pseudonymizes that event's IP |
+| Bot cadence judged only on absolute timing spread | Adds a coefficient-of-variation check (catches slow but perfectly regular macros) and refuses to judge sessions with too little data |
+| No automated tests | 18 `unittest` cases: severity, pseudonymization, evidence IP, bot edge cases, and the false-positive baseline |
+
+Every flagged finding now prints a suggested analyst action (suspend and capture logs, freeze trades and audit, or bot review). Actions are recommendations: a human makes the final call.
 

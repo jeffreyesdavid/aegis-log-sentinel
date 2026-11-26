@@ -1,13 +1,57 @@
 import hashlib
 import hmac
 import math
+import os
 import sqlite3
 import statistics
+import sys
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
 
-HMAC_KEY = b"aegis-local-triage-key-v1"
+# --- Configuration -----------------------------------------------------------
+
+# The pseudonymization key is read from the environment so it never lives in
+# source control. A demo key is used only when none is set, with a warning.
+_DEMO_KEY = b"aegis-demo-key-NOT-FOR-PRODUCTION"
+HMAC_KEY_ENV = "AEGIS_HMAC_KEY"
+
+SPEED_LIMIT_UPS = 120.0       # peak movement speed (units/sec)
+VALUE_SPIKE = 5000.0          # single-event ledger delta
+BOT_MIN_EVENTS = 10           # need this many events before judging cadence
+BOT_MAX_DT_STDEV = 0.05       # seconds
+BOT_MAX_CV = 0.05             # coefficient of variation of inter-action gaps
+BOT_MAX_UNIQUE_RATIO = 0.25   # share of distinct actions
+MIN_DT = 1e-3                 # floor for duplicate timestamps
+
+# Severity is ranked so a finding can only ever be raised, never lowered.
+SEVERITY_RANK = {"CLEAN": 0, "HIGH": 1, "CRITICAL": 2}
+
+SUGGESTED_ACTION = {
+    "speed": "Suspend pending review; capture movement/packet logs",
+    "value": "Freeze trades; open rollback audit on the ledger",
+    "bot": "Flag for bot review; add to automation watchlist",
+}
+
+
+def get_hmac_key() -> bytes:
+    key = os.environ.get(HMAC_KEY_ENV)
+    if key:
+        return key.encode("utf-8")
+    print(
+        f"[warn] {HMAC_KEY_ENV} not set; using demo key. "
+        "Set it before running on real telemetry.",
+        file=sys.stderr,
+    )
+    return _DEMO_KEY
+
+
+HMAC_KEY = get_hmac_key()
+
+
+def escalate(current: str, new: str) -> str:
+    """Return the higher of two severities. CRITICAL can never be downgraded."""
+    return new if SEVERITY_RANK[new] > SEVERITY_RANK[current] else current
 
 
 @dataclass
@@ -23,9 +67,30 @@ class TelemetryEvent:
     value_delta: float
 
 
-def anonymize_pii(raw_value: str, prefix: str) -> str:
-    digest = hmac.new(HMAC_KEY, raw_value.encode("utf-8"), hashlib.sha256).hexdigest()[:12]
+def anonymize_pii(raw_value: str, prefix: str, key: Optional[bytes] = None) -> str:
+    digest = hmac.new(key or HMAC_KEY, raw_value.encode("utf-8"), hashlib.sha256).hexdigest()[:12]
     return f"{prefix}_{digest}"
+
+
+def is_bot_cadence(dts: List[float], actions: List[str]) -> Optional[str]:
+    """Return a reason string if timing and action mix look automated, else None.
+
+    Uses both absolute spread (stdev) and relative spread (coefficient of
+    variation), so a slow but perfectly regular macro is caught too, and a
+    short session never gets judged on too little data.
+    """
+    if len(actions) < BOT_MIN_EVENTS or len(dts) < 2:
+        return None
+    mean_dt = statistics.mean(dts)
+    if mean_dt <= 0:
+        return None
+    dt_stdev = statistics.stdev(dts)
+    cv = dt_stdev / mean_dt
+    unique_ratio = len(set(actions)) / len(actions)
+    regular = dt_stdev < BOT_MAX_DT_STDEV or cv < BOT_MAX_CV
+    if regular and unique_ratio < BOT_MAX_UNIQUE_RATIO:
+        return f"bot_cadence(dt_stdev={dt_stdev:.3f}s, cv={cv:.3f}, unique_ratio={unique_ratio:.2f})"
+    return None
 
 
 def build_synthetic_dataset() -> List[TelemetryEvent]:
@@ -174,61 +239,64 @@ def analyze_players(conn: sqlite3.Connection) -> List[Dict]:
         ev = TelemetryEvent(*r)
         by_player.setdefault(ev.player_id, []).append(ev)
 
-    findings = []
-    for pid, evs in sorted(by_player.items()):
-        speeds = []
-        dts = []
-        max_delta = 0.0
-        total_delta = 0.0
-        actions = [e.action for e in evs]
+    return [analyze_player(pid, evs) for pid, evs in sorted(by_player.items())]
 
-        for prev, curr in zip(evs, evs[1:]):
-            dt = max(curr.timestamp - prev.timestamp, 1e-3)
-            dist = math.hypot(curr.x - prev.x, curr.y - prev.y)
-            speeds.append(dist / dt)
-            dts.append(dt)
 
-        for e in evs:
-            max_delta = max(max_delta, e.value_delta)
-            total_delta += e.value_delta
+def analyze_player(pid: str, evs: List[TelemetryEvent]) -> Dict:
+    """Score one player's time-ordered events."""
+    actions = [e.action for e in evs]
+    dts: List[float] = []
+    peak_speed, speed_event = 0.0, None
+    for prev, curr in zip(evs, evs[1:]):
+        dt = max(curr.timestamp - prev.timestamp, MIN_DT)
+        dts.append(dt)
+        speed = math.hypot(curr.x - prev.x, curr.y - prev.y) / dt
+        if speed > peak_speed:
+            peak_speed, speed_event = speed, curr
 
-        peak_speed = max(speeds) if speeds else 0.0
-        dt_stdev = statistics.stdev(dts) if len(dts) >= 2 else 1.0
-        unique_ratio = len(set(actions)) / max(len(actions), 1)
+    value_event = max(evs, key=lambda e: e.value_delta) if evs else None
+    max_delta = value_event.value_delta if value_event else 0.0
+    total_delta = sum(e.value_delta for e in evs)
 
-        reasons = []
-        severity = None
+    reasons: List[str] = []
+    actions_out: List[str] = []
+    severity = "CLEAN"
+    # The event that triggered the most severe signal; its IP is reported,
+    # not simply the player's first event.
+    evidence: Optional[TelemetryEvent] = None
 
-        if peak_speed > 120.0:
-            reasons.append(f"peak_speed={peak_speed:.1f}u/s (>120.0)")
-            severity = "CRITICAL"
+    if peak_speed > SPEED_LIMIT_UPS:
+        reasons.append(f"peak_speed={peak_speed:.1f}u/s (>{SPEED_LIMIT_UPS})")
+        actions_out.append(SUGGESTED_ACTION["speed"])
+        severity = escalate(severity, "CRITICAL")
+        evidence = evidence or speed_event
 
-        if max_delta >= 5000.0:
-            reasons.append(f"max_value_delta={max_delta:.0f} (>=5000)")
-            severity = "CRITICAL"
+    if max_delta >= VALUE_SPIKE:
+        reasons.append(f"max_value_delta={max_delta:.0f} (>={VALUE_SPIKE:.0f})")
+        actions_out.append(SUGGESTED_ACTION["value"])
+        severity = escalate(severity, "CRITICAL")
+        evidence = evidence or value_event
 
-        if len(evs) >= 10 and dt_stdev < 0.05 and unique_ratio < 0.25:
-            reasons.append(
-                f"bot_cadence(dt_stdev={dt_stdev:.3f}s, unique_ratio={unique_ratio:.2f})"
-            )
-            if severity != "CRITICAL":
-                severity = "HIGH"
+    bot_reason = is_bot_cadence(dts, actions)
+    if bot_reason:
+        reasons.append(bot_reason)
+        actions_out.append(SUGGESTED_ACTION["bot"])
+        severity = escalate(severity, "HIGH")
+        evidence = evidence or evs[-1]
 
-        flagged = bool(reasons)
-        findings.append(
-            {
-                "raw_player_id": pid,
-                "anon_player_id": anonymize_pii(pid, "plr"),
-                "anon_ip": anonymize_pii(evs[0].ip_address, "ip"),
-                "archetype": evs[0].archetype,
-                "flagged": flagged,
-                "severity": severity or "CLEAN",
-                "reasons": reasons,
-                "total_delta": total_delta,
-            }
-        )
-
-    return findings
+    evidence = evidence or evs[0]
+    return {
+        "raw_player_id": pid,
+        "anon_player_id": anonymize_pii(pid, "plr"),
+        "anon_ip": anonymize_pii(evidence.ip_address, "ip"),
+        "evidence_event": evidence.event_id,
+        "archetype": evs[0].archetype,
+        "flagged": bool(reasons),
+        "severity": severity,
+        "reasons": reasons,
+        "actions": actions_out,
+        "total_delta": total_delta,
+    }
 
 
 def main() -> None:
@@ -253,13 +321,15 @@ def main() -> None:
     )
     print("-" * 60)
 
-    for f in findings:
-        if f["flagged"]:
-            reason_str = "; ".join(f["reasons"])
-            print(
-                f"[{f['severity']}] {f['anon_player_id']} ({f['anon_ip']}) "
-                f"-> {reason_str} | net_delta={f['total_delta']:.0f}"
-            )
+    flagged = [f for f in findings if f["flagged"]]
+    flagged.sort(key=lambda f: -SEVERITY_RANK[f["severity"]])
+    for f in flagged:
+        reason_str = "; ".join(f["reasons"])
+        print(
+            f"[{f['severity']}] {f['anon_player_id']} ({f['anon_ip']}, event {f['evidence_event']}) "
+            f"-> {reason_str} | net_delta={f['total_delta']:.0f}"
+        )
+        print(f"    action: {' + '.join(f['actions'])}")
 
 
 if __name__ == "__main__":
